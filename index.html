@@ -170,7 +170,7 @@
 
             // Load image
 
-            const length = 0.25;
+            const length = 0.50;
             group = new THREE.Group();
             group.position.set(0, 0, -0.5);
 
@@ -329,9 +329,13 @@
         function sendUrlToQuest() {
             const urlInput = document.getElementById("urlInput");
             const url = new URL(window.location);
+            if (url.protocol !== "https:") {
+                alert("To send this app to Meta Quest, open its published HTTPS website first. A local file or HTTP address cannot be sent to your headset.");
+                return;
+            }
             url.searchParams.set("image", urlInput.value);
 
-            let sendToQuestUrl = new URL("https://oculus.com/open_url/");
+            let sendToQuestUrl = new URL("https://www.oculus.com/open_url/");
             sendToQuestUrl.searchParams.set("url", url);
             window.location.href = sendToQuestUrl;
         }
@@ -392,7 +396,7 @@
 
         function incrementScale(delta) {
             currentScale += delta;
-            currentScale = Math.min(Math.max(currentScale, 0.0), 4.0);
+            currentScale = Math.max(currentScale, 0.0);
 
             if (group != null) {
                 group.scale.set(currentScale, currentScale, currentScale);
