@@ -125,6 +125,8 @@
         let instructionsPlane = null;
         let currentOpacity = 0.75;
         let currentScale = 1.0;
+        let imageOffsetZ = 0.045;
+        const depthAdjustSpeed = 0.10; // Metres per second along the controller's local Z axis.
         let previousDidPressHideImage = false;
         let previousDidPressHideInstructions = false;
 
@@ -210,7 +212,7 @@
             const textContainer = new ThreeMeshUI.Block({
                 borderRadius: 0.05,
                 width: 0.45,
-                height: 0.60,
+                height: 0.75,
                 padding: 0.05,
                 textAlign: 'left',
                 fontKerning: 'none',
@@ -285,7 +287,7 @@
                 }),
 
                 new ThreeMeshUI.Text({
-                    content: "Reposition image",
+                    content: "Reposition image\nWhile holding trigger:\nAnalog up: move farther\nAnalog down: move closer",
                     fontSize: 0.025,
                     fontColor: new THREE.Color(0xffffff)
                 }),
@@ -448,7 +450,12 @@
                     const axButton = gamepad.buttons[4];
                     const byButton = gamepad.buttons[5];
 
-                    if (vertical > 0.7) {
+                    if (triggerButton.pressed) {
+                        if (Math.abs(vertical) > 0.7) {
+                            // Negative Z points forward along the controller's aiming direction.
+                            imageOffsetZ += vertical * depthAdjustSpeed * elapsedTime;
+                        }
+                    } else if (vertical > 0.7) {
                         incrementScale(-1.0 * elapsedTime);
                     } else if (vertical < -0.7) {
                         incrementScale(1.0 * elapsedTime);
@@ -465,7 +472,7 @@
                     const controllerToUse = renderer.xr.getController(i);
 
                     if (triggerButton.pressed) {
-                        const offsetPosition = controllerToUse.localToWorld(new THREE.Vector3(0, 0, 0.045));
+                        const offsetPosition = controllerToUse.localToWorld(new THREE.Vector3(0, 0, imageOffsetZ));
                         group.position.copy(offsetPosition);
                         group.setRotationFromQuaternion(controllerToUse.quaternion);
                     }
