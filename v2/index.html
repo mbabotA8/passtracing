@@ -1,0 +1,806 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <title>Passtracing</title>
+        <meta charset="utf-8">
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-fork-ribbon-css/0.2.3/gh-fork-ribbon.min.css" />
+        <style>
+        body { margin: 0; }
+
+        .github-fork-ribbon:before { 
+            background-color: #f80; 
+        }
+
+        .popupWindow {
+            position: fixed;
+            top: 12.5%;
+            left: 50%;
+            transform: translate(-50%, -12.5%);
+            background-color: #303841;
+            border-radius: 4px;
+            font-family: SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+            color: #EFEFEF;
+            overflow: hidden;
+        }
+
+        .popupHeader {
+            background-color: #2E3238; 
+            padding: 8px; 
+            text-align: center; 
+            font-size: 75%;
+        }
+
+        .popupSection {
+            padding: 8px; 
+            white-space: pre-wrap; 
+            background-color: #50565E;
+        }
+        </style>
+    </head>
+    <body style="background-color:black;">
+        <!-- Import maps polyfill -->
+        <!-- Remove this when import maps will be widely supported -->
+        <script async src="https://unpkg.com/es-module-shims@1.3.6/dist/es-module-shims.js"></script>
+
+        <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.147.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.147.0/examples/jsm/",
+                "three-mesh-ui": "https://unpkg.com/three-mesh-ui@6.5.2/build/three-mesh-ui.module.js"
+            }
+        }
+        </script>
+
+        <script type="x-shader/x-vertex" id="vertexshader">
+        varying vec2 vUv;
+
+        void main() {
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+        </script>
+
+        <script type="x-shader/x-fragment" id="fragmentshader">
+        uniform sampler2D colorTexture;
+        uniform float opacity;
+        float stepSize = 2.0;
+
+        varying vec2 vUv;
+
+        float intensity(in vec4 color) {
+            return sqrt((color.x*color.x)+(color.y*color.y)+(color.z*color.z));
+        }
+
+        void main() {
+            vec2 uv = vUv;
+            
+            ivec2 imageSize = textureSize(colorTexture, 0);
+            vec2 step = vec2(stepSize/float(imageSize.x), stepSize/float(imageSize.y));
+
+            float topLeft     = intensity(texture2D(colorTexture, uv + vec2(-step.x, step.y)));
+            float left        = intensity(texture2D(colorTexture, uv + vec2(-step.x, 0)));
+            float bottomLeft  = intensity(texture2D(colorTexture, uv + vec2(-step.x, -step.y)));
+            float top         = intensity(texture2D(colorTexture, uv + vec2(0, step.y)));
+            float bottom      = intensity(texture2D(colorTexture, uv + vec2(0, -step.y)));
+            float topRight    = intensity(texture2D(colorTexture, uv + vec2(step.x, step.y)));
+            float right       = intensity(texture2D(colorTexture, uv + vec2(step.x, 0)));
+            float bottomRight = intensity(texture2D(colorTexture, uv + vec2(step.x, -step.y)));
+         
+            float horizontal = topLeft + 2.0 * left + bottomLeft - topRight - 2.0 * right - bottomRight;
+            float vertical = -topLeft - 2.0 * top - topRight + bottomLeft + 2.0 * bottom + bottomRight;
+
+            float sobelResult = sqrt(horizontal * horizontal + vertical * vertical);
+
+            vec4 sobelColor = vec4(1.0 - sobelResult, 1.0 - sobelResult, 1.0 - sobelResult, sobelResult);
+            vec4 currentColor = texture2D(colorTexture, uv);
+
+            float smoothOpacity = smoothstep(0.0, 0.3, opacity);
+
+            gl_FragColor = vec4(
+                currentColor.x * smoothOpacity + (1.0 - smoothOpacity) * sobelColor.x,
+                currentColor.y * smoothOpacity + (1.0 - smoothOpacity) * sobelColor.y,
+                currentColor.z * smoothOpacity + (1.0 - smoothOpacity) * sobelColor.z,
+                currentColor.w * min(opacity, smoothOpacity) + (1.0 - smoothOpacity) * sobelColor.w
+            );
+        }
+        </script>
+
+
+        <script type="module">
+
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        import ThreeMeshUI from 'three-mesh-ui';
+        import { intersectWall } from './v2-wall.mjs';
+        import { openWorkDatabase, readLastWork, writeLastWork } from './v2-storage.mjs';
+
+        let container;
+        let camera, scene, renderer;
+        let controller1, controller2;
+        let clock;
+
+        let group = null;
+        let imagePlane = null;
+        let instructionsPlane = null;
+        let currentOpacity = 0.75;
+        let currentScale = 1.0;
+        let imageOffsetZ = 0.045;
+        const depthAdjustSpeed = 0.10; // Metres per second along the controller's local Z axis.
+        let previousDidPressHideImage = false;
+        let previousDidPressHideInstructions = false;
+        let workDatabase, savedWork = null, imageSourceUrl = null;
+        let activeAnchor = null, restoringAnchor = false, restoreStartedAt = 0;
+        let placementPoint = null, placementQuaternion = null, placingController = null;
+        let previousSaveButton = false, previousTrigger = false;
+        let pendingSave = false, saving = false, roomCaptureOffered = false, previousRoomButton = false, sessionStartedAt = 0;
+        let statusText, statusMessage = '';
+        let manualMode = false;
+        const wallLines = new Map();
+        const wallMaterial = new THREE.LineBasicMaterial({ color: 0x00ff88 });
+        const reticle = new THREE.Mesh(new THREE.RingGeometry(0.012, 0.015, 24), new THREE.MeshBasicMaterial({ color: 0xffff00, side: THREE.DoubleSide }));
+
+        init();
+        animate();
+
+        function init() {
+            container = document.getElementById("container");
+
+            scene = new THREE.Scene();
+
+            camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 10);
+            camera.position.set(0, 0, 1);
+
+            const controls = new OrbitControls(camera, container);
+            controls.minDistance = 0;
+            controls.maxDistance = 8;
+
+            clock = new THREE.Clock();
+
+            // Renderer
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.outputEncoding = THREE.sRGBEncoding;
+            renderer.localClippingEnabled = true;
+            renderer.xr.enabled = true;
+            renderer.xr.setFoveation(0);
+            container.appendChild(renderer.domElement);
+
+            // Controllers
+
+            controller1 = renderer.xr.getController(0);
+            scene.add(controller1);
+
+            controller2 = renderer.xr.getController(1);
+            scene.add(controller2);
+
+            // UI
+
+            makeInstructionsUI();
+
+            // Load image
+
+            const length = 0.50;
+            group = new THREE.Group();
+            group.position.set(0, 0, -0.5);
+
+            scene.add(group);
+            scene.add(reticle);
+            reticle.visible = false;
+
+            const url = new URL(window.location);
+            const calibrationLink = new URL(url);
+            calibrationLink.searchParams.set('image', new URL('Images/calibration.svg', url).href);
+            document.getElementById('calibrationLink').href = calibrationLink.href;
+            const imageUrlString = url.searchParams.get('image');
+
+            let requestedImage = 'Images/discovery.jpg';
+            if (imageUrlString != null) {
+                try {
+                    const imageUrl = new URL(imageUrlString);
+                    document.getElementById("urlInput").value = imageUrlString;
+                    requestedImage = imageUrl.toString();
+                } catch (exception) {
+                    alert("Invalid URL, try a different URL.");
+                }
+            }
+            prepareWork(requestedImage, length);
+            renderer.xr.addEventListener('sessionstart', onSessionStart);
+            renderer.xr.addEventListener('sessionend', onSessionEnd);
+
+            // Resize event
+
+            window.addEventListener('resize', onWindowResize);
+
+            // URL Input
+
+            const inputLink = document.getElementById("urlInputLink");
+            inputLink.onclick = changeImageUrl;
+
+            // Send to Quest
+
+            const sendToQuestLink = document.getElementById("urlToQuestLink");
+            sendToQuestLink.onclick = sendUrlToQuest;
+        }
+
+        function makeInstructionsUI() {
+            const textContainer = new ThreeMeshUI.Block({
+                borderRadius: 0.05,
+                width: 0.45,
+                height: 0.90,
+                padding: 0.05,
+                textAlign: 'left',
+                fontKerning: 'none',
+                whiteSpace: 'pre-wrap',
+                fontFamily: 'https://unpkg.com/three-mesh-ui@6.5.2/examples/assets/Roboto-msdf.json',
+                fontTexture: 'https://unpkg.com/three-mesh-ui@6.5.2/examples/assets/Roboto-msdf.png'
+            });
+
+            textContainer.rotation.y = -45.0 * (Math.PI/180.0);
+            textContainer.position.set(0.5, 0, -0.5);
+
+            textContainer.add(
+                new ThreeMeshUI.Text({
+                    content: "Instructions\n",
+                    fontSize: 0.04,
+                    fontColor: new THREE.Color(0xffff00)
+                }),
+
+                new ThreeMeshUI.Text({
+                    content: "\nAnalog right: ",
+                    fontSize: 0.025,
+                    fontColor: new THREE.Color(0xffff00)
+                }),
+
+                new ThreeMeshUI.Text({
+                    content: "Increase opacity",
+                    fontSize: 0.025,
+                    fontColor: new THREE.Color(0xffffff)
+                }),
+
+                new ThreeMeshUI.Text({
+                    content: "\nAnalog left: ",
+                    fontSize: 0.025,
+                    fontColor: new THREE.Color(0xffff00)
+                }),
+
+                new ThreeMeshUI.Text({
+                    content: "Decrease opacity",
+                    fontSize: 0.025,
+                    fontColor: new THREE.Color(0xffffff)
+                }),
+
+                new ThreeMeshUI.Text({
+                    content: "\n\nAnalog up: ",
+                    fontSize: 0.025,
+                    fontColor: new THREE.Color(0xffff00)
+                }),
+
+                new ThreeMeshUI.Text({
+                    content: "Increase size",
+                    fontSize: 0.025,
+                    fontColor: new THREE.Color(0xffffff)
+                }),
+
+                new ThreeMeshUI.Text({
+                    content: "\nAnalog down: ",
+                    fontSize: 0.025,
+                    fontColor: new THREE.Color(0xffff00)
+                }),
+
+                new ThreeMeshUI.Text({
+                    content: "Decrease size",
+                    fontSize: 0.025,
+                    fontColor: new THREE.Color(0xffffff)
+                }),
+
+
+                new ThreeMeshUI.Text({
+                    content: "\n\nHold trigger: ",
+                    fontSize: 0.025,
+                    fontColor: new THREE.Color(0xffff00)
+                }),
+
+                new ThreeMeshUI.Text({
+                    content: "Reposition image\nWhile holding trigger:\nAnalog up: move farther\nAnalog down: move closer",
+                    fontSize: 0.025,
+                    fontColor: new THREE.Color(0xffffff)
+                }),
+
+                new ThreeMeshUI.Text({
+                    content: "\n\nA or X: ",
+                    fontSize: 0.025,
+                    fontColor: new THREE.Color(0xffff00)
+                }),
+
+                new ThreeMeshUI.Text({
+                    content: "Show/Hide image",
+                    fontSize: 0.025,
+                    fontColor: new THREE.Color(0xffffff)
+                }),
+
+                new ThreeMeshUI.Text({
+                    content: "\nB or Y: ",
+                    fontSize: 0.025,
+                    fontColor: new THREE.Color(0xffff00)
+                }),
+
+                new ThreeMeshUI.Text({
+                    content: "Show/Hide instructions",
+                    fontSize: 0.025,
+                    fontColor: new THREE.Color(0xffffff)
+                }),
+                new ThreeMeshUI.Text({
+                    content: "\n\nV2: apunte a una pared, mantenga el gatillo y sueltelo para colocar. Pulse B/Y para guardar.\n",
+                    fontSize: 0.025,
+                    fontColor: new THREE.Color(0xffffff)
+                }),
+                statusText = new ThreeMeshUI.Text({
+                    content: "Buscando paredes...",
+                    fontSize: 0.025,
+                    fontColor: new THREE.Color(0x00ff88)
+                })
+            );
+
+            scene.add(textContainer);
+            instructionsPlane = textContainer;
+        }
+
+        function changeImageUrl() {
+            const urlInput = document.getElementById("urlInput");
+            const url = new URL(window.location);
+            url.searchParams.set("image", urlInput.value);
+            window.location = url.toString();
+        }
+
+        function sendUrlToQuest() {
+            const urlInput = document.getElementById("urlInput");
+            const url = new URL(window.location);
+            if (url.protocol !== "https:") {
+                alert("To send this app to Meta Quest, open its published HTTPS website first. A local file or HTTP address cannot be sent to your headset.");
+                return;
+            }
+            url.searchParams.set("image", urlInput.value);
+
+            let sendToQuestUrl = new URL("https://www.oculus.com/open_url/");
+            sendToQuestUrl.searchParams.set("url", url);
+            window.location.href = sendToQuestUrl;
+        }
+
+        async function prepareWork(requestedImage, length) {
+            try {
+                workDatabase = await openWorkDatabase();
+                savedWork = await readLastWork(workDatabase);
+            } catch (error) {
+                setStatus('No se pudo abrir el almacenamiento local.');
+            }
+            const choose = document.getElementById('chooseWork');
+            if (savedWork?.version === 1 && savedWork.image instanceof Blob) {
+                choose.hidden = false;
+                document.getElementById('continueWork').onclick = () => {
+                    choose.hidden = true;
+                    restoringAnchor = true;
+                    currentScale = savedWork.scale;
+                    currentOpacity = savedWork.opacity;
+                    imageSourceUrl = savedWork.imageUrl;
+                    loadTexture(group, savedWork.length, URL.createObjectURL(savedWork.image));
+                };
+                document.getElementById('newWork').onclick = () => {
+                    choose.hidden = true;
+                    imageSourceUrl = new URL(requestedImage, window.location.href).href;
+                    loadTexture(group, length, requestedImage);
+                };
+            } else {
+                imageSourceUrl = new URL(requestedImage, window.location.href).href;
+                loadTexture(group, length, requestedImage);
+            }
+        }
+
+        function setStatus(message) {
+            if (statusMessage === message) return;
+            statusMessage = message;
+            document.getElementById('status').textContent = message;
+            if (statusText) statusText.set({ content: message.normalize('NFD').replace(/[\u0300-\u036f]/g, '') });
+        }
+
+        function loadTexture(container, length, url) {
+
+            const loader = new THREE.TextureLoader();
+
+            loader.load(
+                url,
+
+                function (texture) {
+                    document.body.appendChild(ARButton.createButton(renderer, {
+                        requiredFeatures: ['plane-detection', 'anchors'],
+                        optionalFeatures: ['local-floor']
+                    }));
+
+                    let originalWidth = texture.image.width;
+                    let originalHeight = texture.image.height;
+
+                    let max = Math.max(originalWidth, originalHeight);
+                    let width = (originalWidth/max) * length;
+                    let height = (originalHeight/max) * length;
+
+                    const geometry = new THREE.PlaneGeometry(width, height);
+
+                    texture.generateMipmaps = false;
+
+                    const sobelMaterial = new THREE.ShaderMaterial({
+                        transparent: true,
+                        side: THREE.DoubleSide,
+                        uniforms: {
+                            colorTexture: { value: texture },
+                            opacity: { value: currentOpacity }
+                        },
+                        vertexShader: document.getElementById('vertexshader').textContent,
+                        fragmentShader: document.getElementById('fragmentshader').textContent
+                    });
+
+                    imagePlane = new THREE.Mesh(geometry, sobelMaterial);
+
+                    container.add(imagePlane);
+                    group.scale.setScalar(currentScale);
+                    imagePlane.visible = false;
+                    setStatus(restoringAnchor ? 'Imagen guardada lista. Entre en AR para recuperarla.' : 'Imagen lista. Entre en AR para detectar paredes.');
+                },
+
+                undefined,
+
+                function (err) {
+                    alert("Unable to load image, try a different URL.\n\nCross-Origin Resource Sharing (CORS) policies might prevent the app from loading images from certain websites.");
+                }
+            );
+        }
+
+        function incrementOpacity(delta) {
+            currentOpacity += delta;
+            currentOpacity = Math.min(Math.max(currentOpacity, 0.0), 1.0);
+
+            if (imagePlane != null) {
+                imagePlane.material.uniforms["opacity"].value = currentOpacity;
+            }
+        }
+
+        function incrementScale(delta) {
+            currentScale += delta;
+            currentScale = Math.max(currentScale, 0.0);
+
+            if (group != null) {
+                group.scale.set(currentScale, currentScale, currentScale);
+            }
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize( window.innerWidth, window.innerHeight );
+        }
+
+        //
+
+        function animate() {
+            renderer.setAnimationLoop(loop);
+        }
+
+        function loop(time, frame) {
+            if (frame) updateWalls(frame);
+            updateInput(frame);
+            if (frame) updateAnchor(frame);
+            ThreeMeshUI.update();
+            renderer.render(scene, camera);
+        }
+
+        function onSessionStart() {
+            const session = renderer.xr.getSession();
+            manualMode = document.getElementById('manualMode').checked;
+            sessionStartedAt = performance.now();
+            roomCaptureOffered = false;
+            if (manualMode) {
+                restoringAnchor = false;
+                imagePlane.visible = true;
+                setStatus('Modo manual: gatillo para colocar; joystick para ajustar profundidad.');
+            } else if (restoringAnchor) {
+                if (!session?.restorePersistentAnchor || !savedWork?.anchorId) {
+                    setStatus('Este navegador no puede recuperar anclajes.');
+                    return;
+                }
+                imagePlane.visible = false;
+                restoreStartedAt = performance.now();
+                setStatus('Buscando la posición guardada...');
+                session.restorePersistentAnchor(savedWork.anchorId).then(anchor => {
+                    activeAnchor = anchor;
+                }).catch(() => setStatus('No se pudo recuperar el anclaje. El trabajo sigue guardado.'));
+            } else {
+                setStatus('Buscando paredes...');
+            }
+        }
+
+        function onSessionEnd() {
+            activeAnchor = null;
+            placingController = null;
+            previousTrigger = false;
+            reticle.visible = false;
+            for (const line of wallLines.values()) {
+                scene.remove(line);
+                line.geometry.dispose();
+            }
+            wallLines.clear();
+        }
+
+        function wallRotation(normal) {
+            const up = new THREE.Vector3(0, 1, 0);
+            const right = up.clone().cross(normal).normalize();
+            const vertical = normal.clone().cross(right).normalize();
+            return new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(right, vertical, normal));
+        }
+
+        function updateWalls(frame) {
+            if (manualMode) return;
+            const referenceSpace = renderer.xr.getReferenceSpace();
+            if (!referenceSpace) return;
+            const seen = new Set();
+            const walls = [];
+            for (const plane of frame.detectedPlanes || []) {
+                if (plane.orientation !== 'vertical' || plane.semanticLabel && plane.semanticLabel !== 'wall') continue;
+                const pose = frame.getPose(plane.planeSpace, referenceSpace);
+                if (!pose || plane.polygon.length < 3) continue;
+                const object = new THREE.Object3D();
+                object.position.copy(pose.transform.position);
+                object.quaternion.copy(pose.transform.orientation);
+                object.updateMatrixWorld(true);
+                const wall = {
+                    orientation: plane.orientation, semanticLabel: plane.semanticLabel,
+                    position: object.position, normal: new THREE.Vector3(0, 1, 0).applyQuaternion(object.quaternion),
+                    polygon: plane.polygon, worldToLocal: point => object.worldToLocal(point)
+                };
+                walls.push(wall);
+                seen.add(plane);
+                let line = wallLines.get(plane);
+                if (!line || line.userData.lastChangedTime !== plane.lastChangedTime) {
+                    if (line) { scene.remove(line); line.geometry.dispose(); }
+                    const points = plane.polygon.map(vertex => new THREE.Vector3(vertex.x, 0, vertex.z));
+                    line = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(points), wallMaterial);
+                    line.userData.lastChangedTime = plane.lastChangedTime;
+                    wallLines.set(plane, line);
+                    scene.add(line);
+                }
+                line.position.copy(object.position);
+                line.quaternion.copy(object.quaternion);
+            }
+            for (const [plane, line] of wallLines) {
+                if (!seen.has(plane)) { scene.remove(line); line.geometry.dispose(); wallLines.delete(plane); }
+            }
+            currentWalls = walls;
+            if (!restoringAnchor && !walls.length && performance.now() - sessionStartedAt > 3000) {
+                roomCaptureOffered = true;
+                setStatus('Sin paredes. Pulse A/X para configurar la habitación.');
+            } else if (!restoringAnchor && walls.length && !placementPoint) {
+                setStatus(`${walls.length} pared(es) detectada(s). Apunte y pulse el gatillo.`);
+            }
+        }
+
+        let currentWalls = [];
+
+        function updateAnchor(frame) {
+            if (pendingSave && !saving) {
+                pendingSave = false;
+                saveWork(frame);
+            }
+            if (!activeAnchor) {
+                if (restoringAnchor && restoreStartedAt && performance.now() - restoreStartedAt > 30000)
+                    setStatus('No se localizó en 30 s. Salga de AR y vuelva a intentarlo.');
+                return;
+            }
+            const pose = frame.getPose(activeAnchor.anchorSpace, renderer.xr.getReferenceSpace());
+            if (!pose) {
+                imagePlane.visible = false;
+                if (restoreStartedAt && performance.now() - restoreStartedAt > 30000)
+                    setStatus('No se localizó en 30 s. Salga de AR y vuelva a intentarlo.');
+                else setStatus('Seguimiento perdido. Buscando la posición guardada...');
+                return;
+            }
+            group.position.copy(pose.transform.position);
+            group.quaternion.copy(pose.transform.orientation);
+            imagePlane.visible = true;
+            if (restoringAnchor) setStatus('Posición recuperada. Compruebe las marcas de medición.');
+        }
+
+        async function saveWork(frame) {
+            if (!placementPoint || !placementQuaternion || !workDatabase) {
+                setStatus('Coloque la imagen en una pared antes de guardar.');
+                return;
+            }
+            if (!frame.createAnchor) {
+                setStatus('Este navegador no permite crear anclajes.');
+                return;
+            }
+            saving = true;
+            let newAnchor = null, newHandle = null;
+            try {
+                setStatus('Guardando imagen y anclaje...');
+                const image = await (await fetch(imageSourceUrl, { mode: 'cors' })).blob();
+                if (!image.type.startsWith('image/')) throw new Error('La URL no devolvió una imagen.');
+                // createAnchor must use an active XRFrame, so request a new frame after the fetch.
+                const session = renderer.xr.getSession();
+                const referenceSpace = renderer.xr.getReferenceSpace();
+                await new Promise((resolve, reject) => session.requestAnimationFrame((_, anchorFrame) => {
+                    anchorFrame.createAnchor(new XRRigidTransform(placementPoint, placementQuaternion), referenceSpace)
+                        .then(resolve, reject);
+                })).then(anchor => { newAnchor = anchor; });
+                if (!newAnchor.requestPersistentHandle) throw new Error('La persistencia no está disponible.');
+                newHandle = await newAnchor.requestPersistentHandle();
+                const previous = savedWork;
+                const work = {
+                    version: 1, anchorId: newHandle, image, imageUrl: imageSourceUrl,
+                    length: Math.max(imagePlane.geometry.parameters.width, imagePlane.geometry.parameters.height),
+                    scale: currentScale, opacity: currentOpacity, savedAt: new Date().toISOString()
+                };
+                await writeLastWork(workDatabase, work);
+                savedWork = work;
+                activeAnchor = newAnchor;
+                setStatus('Guardado. Vuelva más tarde para medir la precisión.');
+                if (previous?.anchorId && previous.anchorId !== newHandle)
+                    session.deletePersistentAnchor?.(previous.anchorId).catch(console.warn);
+            } catch (error) {
+                if (newHandle) renderer.xr.getSession()?.deletePersistentAnchor?.(newHandle).catch(console.warn);
+                newAnchor?.delete();
+                setStatus(`No se guardó: ${error.message}`);
+            } finally {
+                saving = false;
+            }
+        }
+
+        function updateInput(frame) {
+            const xrSession = renderer.xr.getSession();
+            const elapsedTime = clock.getDelta();
+
+            let didPressHideImage = false;
+            let didPressHideInstructions = false;
+
+            if (xrSession == null || xrSession.inputSources.length <= 0) {
+                return;
+            }
+
+            let triggerDown = false, saveDown = false, roomDown = false;
+            let hitForPlacement = null;
+            let controllerForPlacement = null;
+
+            for (let i = 0; i < xrSession.inputSources.length; i++) {
+                const input = xrSession.inputSources[i];
+                const gamepad = input.gamepad; 
+
+                if (
+                    gamepad != null && 
+                    gamepad.mapping == "xr-standard" &&
+                    gamepad.axes.length >= 4
+                ) {
+                    const horizontal = gamepad.axes[2]; // Primary thumbstick X
+                    const vertical = gamepad.axes[3]; // Primary thumbstick Y
+
+                    const triggerButton = gamepad.buttons[0];
+                    const axButton = gamepad.buttons[4];
+                    const byButton = gamepad.buttons[5];
+
+                    if (!manualMode && !restoringAnchor) {
+                        if (triggerButton.pressed && placingController === null)
+                            placingController = i;
+                        if (placingController === i && triggerButton.pressed) {
+                            triggerDown = true;
+                            controllerForPlacement = renderer.xr.getController(i);
+                        }
+                        saveDown ||= byButton?.pressed || false;
+                        roomDown ||= axButton?.pressed || false;
+                    }
+
+                    if (manualMode && triggerButton.pressed) {
+                        if (Math.abs(vertical) > 0.7) {
+                            // Negative Z points forward along the controller's aiming direction.
+                            imageOffsetZ += vertical * depthAdjustSpeed * elapsedTime;
+                        }
+                    } else if (!triggerButton.pressed && vertical > 0.7) {
+                        incrementScale(-1.0 * elapsedTime);
+                    } else if (!triggerButton.pressed && vertical < -0.7) {
+                        incrementScale(1.0 * elapsedTime);
+                    }
+
+                    if (horizontal > 0.7) {
+                        incrementOpacity(1.0 * elapsedTime);
+                    } else if (horizontal < -0.7) {
+                        incrementOpacity(-1.0 * elapsedTime);
+                    }
+
+                    // FIXME: This index won't match the correct controller
+                    // if a disconnection happens during the session.
+                    const controllerToUse = renderer.xr.getController(i);
+
+                    if (manualMode && triggerButton.pressed) {
+                        const offsetPosition = controllerToUse.localToWorld(new THREE.Vector3(0, 0, imageOffsetZ));
+                        group.position.copy(offsetPosition);
+                        group.setRotationFromQuaternion(controllerToUse.quaternion);
+                    }
+
+                    if (manualMode && axButton.pressed) {
+                        didPressHideImage = true;
+                    }
+
+                    if (manualMode && byButton.pressed) {
+                        didPressHideInstructions = true;
+                    }
+                }
+            }
+
+            if (!manualMode && !restoringAnchor) {
+                const controller = controllerForPlacement || renderer.xr.getController(0);
+                const origin = controller.getWorldPosition(new THREE.Vector3());
+                const direction = new THREE.Vector3(0, 0, -1).applyQuaternion(controller.getWorldQuaternion(new THREE.Quaternion()));
+                hitForPlacement = intersectWall(origin, direction, currentWalls);
+                reticle.visible = !!hitForPlacement;
+                if (hitForPlacement) {
+                    reticle.position.copy(hitForPlacement.point);
+                    reticle.quaternion.copy(wallRotation(hitForPlacement.normal));
+                }
+                if (triggerDown && hitForPlacement) {
+                    activeAnchor = null;
+                    placementPoint = hitForPlacement.point.clone();
+                    placementQuaternion = wallRotation(hitForPlacement.normal);
+                    group.position.copy(placementPoint);
+                    group.quaternion.copy(placementQuaternion);
+                    imagePlane.visible = true;
+                    setStatus('Colocando sobre la pared. Suelte el gatillo para fijar.');
+                }
+                if (previousTrigger && !triggerDown) {
+                    placingController = null;
+                    if (placementPoint) setStatus('Imagen colocada. Pulse B/Y para guardar.');
+                }
+                if (saveDown && !previousSaveButton) pendingSave = true;
+                if (roomDown && !previousRoomButton && roomCaptureOffered) {
+                    if (typeof xrSession.initiateRoomCapture === 'function')
+                        xrSession.initiateRoomCapture().catch(() => setStatus('Configure la habitación en Ajustes de Quest.'));
+                    else setStatus('Configure la habitación en Ajustes de Quest.');
+                    roomCaptureOffered = false;
+                }
+            }
+            previousTrigger = triggerDown;
+            previousSaveButton = saveDown;
+            previousRoomButton = roomDown;
+
+            const shouldChangeInstructionsVisibility = (!didPressHideInstructions && previousDidPressHideInstructions);
+            previousDidPressHideInstructions = didPressHideInstructions;
+
+            if (shouldChangeInstructionsVisibility) {
+                instructionsPlane.visible = !instructionsPlane.visible;
+            }
+
+            const shouldChangeImageVisibility = (!didPressHideImage && previousDidPressHideImage);
+            previousDidPressHideImage = didPressHideImage;
+
+            if (shouldChangeImageVisibility) {
+                imagePlane.visible = !imagePlane.visible;
+            }
+        }
+
+        </script>
+
+        <a class="github-fork-ribbon" href="https://github.com/fabio914/passtracing" data-ribbon="Fork me on GitHub" title="Fork me on GitHub">Fork me on GitHub</a>
+
+        <div id="container"></div>
+
+        <div class="popupWindow">
+            <div class="popupHeader">Passtracing - AR Tracing</div>
+            <div class="popupSection">1. Paste an image URL below.<br/>2. Click on "Load image" or "Send link to Meta Quest".<br/>3. Click on the "Start AR" button below to start.</div>
+            <div class="popupSection" id="chooseWork" hidden><button id="continueWork">Continuar último trabajo</button> <button id="newWork">Nuevo trabajo</button></div>
+            <div class="popupSection"><label><input type="checkbox" id="manualMode"> Modo manual</label></div>
+            <div class="popupSection" id="status" role="status">Preparando trabajo...</div>
+            <div class="popupSection"><div style="margin-right: 8px"><input id="urlInput" type="url" style="width: 100%" placeholder="https://paste.some.website/image/here.jpg"/></div></div>
+            <div class="popupSection"><a id="calibrationLink" href="#">Imagen de calibración (9 cruces)</a></div>
+            <div class="popupSection"><a href="#" style="color: #EFEFEF" id="urlInputLink">Load image</a></div>
+            <div class="popupSection"><a href="#" style="color: #EFEFEF" id="urlToQuestLink">Send link to Meta Quest</a></div>
+        </div>
+    </body>
+</html>
