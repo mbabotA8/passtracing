@@ -1,5 +1,15 @@
 # Passtracing
 
+## V3 — controles independientes y movimiento ampliado
+
+Versión de prueba: https://mbabota8.github.io/passtracing/v3/
+
+El joystick izquierdo desplaza la imagen sobre su plano (máximo 10 cm/s); el mando derecho conserva sus controles. Los gatillos y botones X/Y mantienen sus funciones. Disponible en modo manual y sobre paredes, también con anclajes recuperados.
+
+Antes de entrar en AR se puede activar **Movimiento ampliado — experimental**. Solicita un espacio `unbounded` y vuelve a `local-floor` si no está disponible. El perímetro físico se configura en Quest. El efecto real sobre los avisos e interrupciones debe validarse en el visor.
+
+Los trabajos de V3 se guardan por separado de V2. La calibración y precisión del guardado continúan en V2. Consulte [VALIDATION-V3.md](VALIDATION-V3.md) para los controles y las pruebas de aceptación. Pruebas automáticas: `node --test`.
+
 **Drawing/tracing projector in Augmented Reality (Passthrough)**
 
 This is a simple [WebXR](https://immersiveweb.dev) app built with [three.js](https://threejs.org) and [three-mesh-ui](https://felixmariotto.github.io/three-mesh-ui/) that lets you use your Meta Quest 2 and Meta Quest Pro to draw/trace on top of virtual images in Augmented Reality.

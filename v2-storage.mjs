@@ -1,4 +1,4 @@
-const DATABASE = 'passtracing-v2';
+const DATABASE = 'passtracing-v3';
 const STORE = 'last-work';
 
 export function openWorkDatabase() {
